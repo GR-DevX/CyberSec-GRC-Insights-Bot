@@ -1,0 +1,11 @@
+services:
+  bot:
+    image: cybersec-bot
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env  # Docker-compose сам подтянет ключи из локального .env
+    volumes: # Используем более явный и надежный синтаксис
+      - type: bind
+        source: ./history.txt
+        target: /app/history.txt

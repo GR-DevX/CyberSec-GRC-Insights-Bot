@@ -1,15 +1,17 @@
-import time
-import threading
-import feedparser
-import schedule
-import telebot
+import logging
 import os
 import sys
+import threading
+import time
+
+import feedparser
 import requests
+import schedule
+import telebot
 from dotenv import load_dotenv  # pip install python-dotenv
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from google import genai
 from groq import Groq  # pip install groq
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # Загрузка переменных окружения
 load_dotenv(".env")
@@ -17,62 +19,72 @@ load_dotenv(".env")
 # ==========================================
 # 🔴 НАСТРОЙКИ (КЛЮЧИ ИЗ .ENV)
 # ==========================================
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+)
+
+# --- Telegram ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", 0))
 
-if not CHAT_ID:
-    print("❌ ОШИБКА: CHAT_ID не найден в .env!")
-    sys.exit(1)
-
-# Ключи API
+# --- API Ключи ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+LINKEDIN_ACCESS_TOKEN = os.getenv("LINKEDIN_ACCESS_TOKEN")
 
-# Проверка, что ключи загрузились
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    print("❌ ОШИБКА: Не найдены ключи в .env файле!")
-    print(
-        "Убедись, что создал файл .env и прописал там TELEGRAM_TOKEN и GEMINI_API_KEY"
-    )
-    sys.exit(1)
+# --- Настройки контента ---
+RSS_URLS = os.getenv("RSS_URLS", "").split(",")
+KEYWORDS_INCLUDE = os.getenv("KEYWORDS_INCLUDE", "").split(",")
+KEYWORDS_EXCLUDE = os.getenv("KEYWORDS_EXCLUDE", "").split(",")
 
-RSS_URLS = [
-    "https://www.heise.de/rss/heise-security.rdf",
-    "https://feeds.feedburner.com/TheHackersNews",
-    "https://www.bsi.bund.de/SiteGlobals/Functions/RSS/RSS_Feed_Presse.xml",
-    "https://www.security-insider.de/rss/",
-    "https://www.computerweekly.com/de/rss/Security.xml",
-]
+# --- Настройки моделей AI ---
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-flash-latest")
+GROQ_MODEL = "llama-3.3-70b-versatile" # Жестко задаем актуальную модель
 
-KEYWORDS_INCLUDE = [
-    "Security",
-    "Ransomware",
-    "Cyber",
-    "Hack",
-    "Data",
-    "AI",
-    "Bravia",
-    "Sony",
-]
-KEYWORDS_EXCLUDE = ["Crypto", "Bitcoin"]
-
+# --- Файл истории ---
 HISTORY_FILE = "history.txt"
+# ==========================================
+# ПРОВЕРКА КРИТИЧЕСКИХ ПЕРЕМЕННЫХ
+# ==========================================
+def validate_env_vars():
+    """Проверяет наличие всех необходимых переменных окружения."""
+    required_vars = {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "CHAT_ID": CHAT_ID,
+        "GEMINI_API_KEY": GEMINI_API_KEY, # Этот токен тоже важен
+        "LINKEDIN_ACCESS_TOKEN": LINKEDIN_ACCESS_TOKEN, # Этот токен тоже важен
+        "RSS_URLS": RSS_URLS and RSS_URLS[0], # Проверяем, что список не пустой
+        "KEYWORDS_INCLUDE": KEYWORDS_INCLUDE and KEYWORDS_INCLUDE[0], # И здесь тоже
+    }
+    missing_vars = [key for key, value in required_vars.items() if not value]
+    if missing_vars:
+        logging.error(f"❌ Критическая ошибка: Отсутствуют переменные в .env: {', '.join(missing_vars)}")
+        sys.exit(1)
+
+validate_env_vars()
+
+if not GROQ_API_KEY:
+    logging.warning("⚠️ GROQ_API_KEY не найден. Бот будет работать только с Gemini.")
 
 # ==========================================
 # ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
 # ==========================================
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# Инициализация Gemini
-# ВАЖНО: Убедись, что стоит библиотека google-genai (pip install google-genai)
 client_gemini = genai.Client(api_key=GEMINI_API_KEY)
 
+# Конфигурация Gemini (google-genai подхватит ключ из окружения)
+# genai.configure(api_key=GEMINI_API_KEY) # Старый метод, больше не используется
 # Инициализация Groq
 client_groq = None
 if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
     client_groq = Groq(api_key=GROQ_API_KEY)
 
+# Глобальные переменные для хранения состояния
 processed_links = set()
+drafts_in_memory = {}
 
 # ==========================================
 # ЛОГИКА ПАМЯТИ (HISTORY.TXT)
@@ -81,8 +93,13 @@ processed_links = set()
 
 def load_history():
     """Загружает ссылки из файла в память при старте"""
+    # Проверка, не является ли путь директорией (частая ошибка с Docker-volumes)
+    if os.path.isdir(HISTORY_FILE):
+        logging.error(f"❌ ОШИБКА: '{HISTORY_FILE}' является директорией. Удалите ее и перезапустите бота.")
+        sys.exit(1)
+    # Если файла нет, создаем его, чтобы избежать ошибок при первом запуске
     if not os.path.exists(HISTORY_FILE):
-        return set()
+        open(HISTORY_FILE, 'a').close()
     with open(HISTORY_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f if line.strip())
 
@@ -101,14 +118,27 @@ processed_links = load_history()
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 
+def generate_image_smart(text_prompt):
+    """
+    [ЗАГЛУШКА] Генерирует изображение на основе текста.
+    Эта функция - заглушка. Для реальной генерации нужна интеграция
+    с DALL-E, Imagen, Pollinations AI или другой моделью.
+    """
+    logging.info(f"🖼️ [ЗАГЛУШКА] Начата генерация изображения для промпта: {text_prompt[:50]}...")
+    # Здесь должен быть код для вызова API генерации изображений.
+    # В данный момент функция возвращает None, чтобы показать, что картинка не была создана.
+    image_path = None
+    if image_path:
+        logging.info(f"✅ Изображение успешно сгенерировано и сохранено: {image_path}")
+    else:
+        logging.warning("⚠️ Генерация изображения пропущена (функция-заглушка).")
+    return image_path
 
 def post_to_linkedin(text):
-    token = os.getenv("LINKEDIN_ACCESS_TOKEN")
-
     # Сначала получаем ваш ID пользователя (URN)
     user_info = requests.get(
         "https://api.linkedin.com/v2/userinfo",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}"},
     ).json()
 
     author_id = user_info.get("sub")  # Это ваш уникальный идентификатор
@@ -130,12 +160,12 @@ def post_to_linkedin(text):
     response = requests.post(
         "https://api.linkedin.com/v2/ugcPosts",
         headers={
-            "Authorization": f"Bearer {token}",
+            "Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}",
             "X-Restli-Protocol-Version": "2.0.0",
         },
         json=post_data,
     )
-    print(f"Ответ LinkedIn: {response.status_code}, {response.text}")
+    logging.info(f"Ответ LinkedIn: {response.status_code}, {response.text}")
     return response.status_code == 201
 
 
@@ -252,28 +282,26 @@ def clean_response_text(text):
 # ГЕНЕРАТОР ПОСТОВ
 # ==========================================
 def generate_linkedin_post(title, summary, link):
-    print(f"🧠 Генерирую пост: {title[:20]}...")
+    logging.info(f"🧠 Генерирую пост: {title[:30]}...")
     prompt_text = create_prompt(title, summary, link)
 
     # --- ПОПЫТКА 1: GEMINI (Google) ---
     try:
-        print("🔹 Пробую Gemini (flash-latest)...")
+        logging.info(f"🔹 Пробую Gemini ({GEMINI_MODEL})...")
         response = client_gemini.models.generate_content(
-            model="gemini-flash-latest",
+            model=GEMINI_MODEL,
             contents=prompt_text,
-            config={
-                "temperature": 0.3
-            },  # <--- Добавь это (было по умолчанию около 0.7-1.0)
+            config={"temperature": 0.3},
         )
-        print("✅ Gemini успешно сгенерировал.")
+        logging.info("✅ Gemini успешно сгенерировал.")
         return clean_response_text(response.text)
 
     except Exception as e_gemini:
-        print(f"⚠️ Ошибка Gemini: {e_gemini}")
+        logging.warning(f"⚠️ Ошибка Gemini: {e_gemini}")
 
         # --- ПОПЫТКА 2: GROQ (Llama 3 - Бесплатно) ---
         if client_groq:
-            print("🔄 Переключаюсь на Groq (llama-3.3-70b)...")
+            logging.info(f"🔄 Переключаюсь на Groq ({GROQ_MODEL})...")
             try:
                 chat_completion = client_groq.chat.completions.create(
                     messages=[
@@ -283,10 +311,10 @@ def generate_linkedin_post(title, summary, link):
                         },
                         {"role": "user", "content": prompt_text},
                     ],
-                    model="llama-3.3-70b-versatile",  # Мощная бесплатная модель
+                    model=GROQ_MODEL,
                     temperature=0.3,  # <--- Добавь это. 0.3 делает его строже.
                 )
-                print("✅ Groq успешно сгенерировал.")
+                logging.info("✅ Groq успешно сгенерировал.")
                 return clean_response_text(chat_completion.choices[0].message.content)
             except Exception as e_groq:
                 return f"❌ Ошибка обоих нейросетей. Groq Error: {e_groq}"
@@ -300,7 +328,7 @@ def generate_linkedin_post(title, summary, link):
 def check_news():
     global processed_links
 
-    print("🔎 Сканирую новости...")
+    logging.info("🔎 Сканирую новости...")
     new_post_found = False
 
     for url in RSS_URLS:
@@ -320,7 +348,7 @@ def check_news():
                 # 2. Проверка релевантности
                 full_text = f"{entry.title} {entry.description}"
                 if is_relevant(full_text):
-                    print(f"🔥 Нашел: {entry.title}")
+                    logging.info(f"🔥 Нашел релевантную новость: {entry.title}")
 
                     # 3. Генерация
                     draft = generate_linkedin_post(
@@ -331,38 +359,59 @@ def check_news():
                     save_to_history(str(entry.link))
                     processed_links.add(str(entry.link))
 
-                    # 5. Отправка
+                    # 5. ВЫЗЫВАЕМ ГЕНЕРАЦИЮ КАРТИНКИ
+                    image_path = generate_image_smart(draft)
+
+                    # 6. ОТПРАВЛЯЕМ В TELEGRAM
                     markup = InlineKeyboardMarkup()
                     markup.add(
-                        InlineKeyboardButton(
+                        InlineKeyboardButton( # type: ignore
                             "🚀 Posten", callback_data="post_to_linkedin"
                         )
                     )
-
                     try:
-                        bot.send_message(
+                        # Если картинка успешно создалась, отправляем сначала её
+                        if image_path:
+                            with open(image_path, 'rb') as photo:
+                                bot.send_photo(chat_id=CHAT_ID, photo=photo)
+                            logging.info("✅ Картинка отправлена в Telegram.")
+
+                        # Затем отправляем сам текст поста с кнопкой
+                        sent_message = bot.send_message(
                             CHAT_ID,
                             f"📰 {entry.title}\n\n📝 {draft}",
                             reply_markup=markup,
                         )
+                        logging.info(f"✅ Черновик отправлен в Telegram. ID: {sent_message.message_id}")
+
+                        # Сохраняем черновик в память, привязав к ID сообщения
+                        drafts_in_memory[sent_message.message_id] = draft
                         new_post_found = True
                         break
                     except Exception as e_tg:
-                        print(f"Ошибка отправки в TG: {e_tg}")
+                        logging.error(f"❌ Ошибка отправки в Telegram: {e_tg}")
                 else:
                     # Если не релевантно - запоминаем, чтобы не проверять снова
                     processed_links.add(str(entry.link))
 
         except Exception as e:
-            print(f"RSS Error ({url}): {e}")
+            logging.error(f"❌ Ошибка при парсинге RSS ({url}): {e}")
+            
+    if not new_post_found:
+        logging.info("✅ Сканирование завершено. Новых релевантных новостей нет.")
 
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
     if call.data == "post_to_linkedin":
-        # Берем текст из самого сообщения
-        text_to_post = call.message.text
-
+        # Извлекаем правильный текст из словаря по ID сообщения
+        text_to_post = drafts_in_memory.get(call.message.message_id)
+        if not text_to_post:
+            bot.answer_callback_query(
+                call.id,
+                "❌ Ошибка: черновик не найден. Возможно, бот был перезапущен.",
+            )
+            return
         success = post_to_linkedin(text_to_post)
 
         if success:
@@ -372,7 +421,7 @@ def callback(call):
 
 
 if __name__ == "__main__":
-    print(f"📂 Загружено {len(processed_links)} ссылок из history.txt")
+    logging.info(f"📂 Загружено {len(processed_links)} ссылок из history.txt")
 
     # 1. Сразу при запуске проверяем новости один раз
     check_news()
@@ -389,11 +438,11 @@ if __name__ == "__main__":
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
 
-    print("🤖 Бот запущен и работает в режиме 24/7...")
+    logging.info("🤖 Бот запущен и готов к работе...")
 
     # 3. Запускаем бесконечный опрос Telegram
     try:
         bot.polling(none_stop=True)
     except Exception as e:
-        print(f"Ошибка во время работы бота: {e}")
+        logging.critical(f"💥 Критическая ошибка в главном цикле polling: {e}")
         time.sleep(15)  # Пауза перед перезапуском при сбое сети
