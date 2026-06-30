@@ -3,13 +3,13 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 
 import feedparser
 import requests
 import schedule
 import telebot
-from dotenv import load_dotenv  # pip install python-dotenv
-from google import genai
+from dotenv import load_dotenv
 from groq import Groq  # pip install groq
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -31,21 +31,18 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", 0))
 
 # --- API Ключи ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-LINKEDIN_ACCESS_TOKEN = os.getenv("LINKEDIN_ACCESS_TOKEN")
 
 # --- Настройки контента ---
-RSS_URLS = os.getenv("RSS_URLS", "").split(",")
+RSS_URLS = [url.strip(' "') for url in os.getenv("RSS_URLS", "").split(",") if url.strip()]
 KEYWORDS_INCLUDE = os.getenv("KEYWORDS_INCLUDE", "").split(",")
 KEYWORDS_EXCLUDE = os.getenv("KEYWORDS_EXCLUDE", "").split(",")
-
-# --- Настройки моделей AI ---
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-flash-latest")
-GROQ_MODEL = "llama-3.3-70b-versatile" # Жестко задаем актуальную модель
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # --- Файл истории ---
 HISTORY_FILE = "history.txt"
+
+
 # ==========================================
 # ПРОВЕРКА КРИТИЧЕСКИХ ПЕРЕМЕННЫХ
 # ==========================================
@@ -54,29 +51,25 @@ def validate_env_vars():
     required_vars = {
         "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
         "CHAT_ID": CHAT_ID,
-        "GEMINI_API_KEY": GEMINI_API_KEY, # Этот токен тоже важен
-        "LINKEDIN_ACCESS_TOKEN": LINKEDIN_ACCESS_TOKEN, # Этот токен тоже важен
-        "RSS_URLS": RSS_URLS and RSS_URLS[0], # Проверяем, что список не пустой
-        "KEYWORDS_INCLUDE": KEYWORDS_INCLUDE and KEYWORDS_INCLUDE[0], # И здесь тоже
+        "GROQ_API_KEY": GROQ_API_KEY,
+        "RSS_URLS": RSS_URLS and RSS_URLS[0],  # Проверяем, что список не пустой
+        "KEYWORDS_INCLUDE": KEYWORDS_INCLUDE and KEYWORDS_INCLUDE[0],  # И здесь тоже
     }
     missing_vars = [key for key, value in required_vars.items() if not value]
     if missing_vars:
-        logging.error(f"❌ Критическая ошибка: Отсутствуют переменные в .env: {', '.join(missing_vars)}")
+        logging.error(
+            f"❌ Критическая ошибка: Отсутствуют переменные в .env: {', '.join(missing_vars)}"
+        )
         sys.exit(1)
 
-validate_env_vars()
 
-if not GROQ_API_KEY:
-    logging.warning("⚠️ GROQ_API_KEY не найден. Бот будет работать только с Gemini.")
+validate_env_vars()
 
 # ==========================================
 # ИНИЦИАЛИЗАЦИЯ КЛИЕНТОВ
 # ==========================================
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-client_gemini = genai.Client(api_key=GEMINI_API_KEY)
 
-# Конфигурация Gemini (google-genai подхватит ключ из окружения)
-# genai.configure(api_key=GEMINI_API_KEY) # Старый метод, больше не используется
 # Инициализация Groq
 client_groq = None
 if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
@@ -84,7 +77,9 @@ if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
 
 # Глобальные переменные для хранения состояния
 processed_links = set()
-drafts_in_memory = {}
+# Храним исходные данные новостей для перегенерации на других языках
+# Структура: {message_id: {"title": title, "summary": summary, "link": link}}
+news_storage = {}
 
 # ==========================================
 # ЛОГИКА ПАМЯТИ (HISTORY.TXT)
@@ -93,13 +88,13 @@ drafts_in_memory = {}
 
 def load_history():
     """Загружает ссылки из файла в память при старте"""
-    # Проверка, не является ли путь директорией (частая ошибка с Docker-volumes)
     if os.path.isdir(HISTORY_FILE):
-        logging.error(f"❌ ОШИБКА: '{HISTORY_FILE}' является директорией. Удалите ее и перезапустите бота.")
+        logging.error(
+            f"❌ ОШИБКА: '{HISTORY_FILE}' является директорией. Удалите ее и перезапустите бота."
+        )
         sys.exit(1)
-    # Если файла нет, создаем его, чтобы избежать ошибок при первом запуске
     if not os.path.exists(HISTORY_FILE):
-        open(HISTORY_FILE, 'a').close()
+        open(HISTORY_FILE, "a").close()
     with open(HISTORY_FILE, "r", encoding="utf-8") as f:
         return set(line.strip() for line in f if line.strip())
 
@@ -118,161 +113,140 @@ processed_links = load_history()
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 
-def generate_image_smart(text_prompt):
-    """
-    [ЗАГЛУШКА] Генерирует изображение на основе текста.
-    Эта функция - заглушка. Для реальной генерации нужна интеграция
-    с DALL-E, Imagen, Pollinations AI или другой моделью.
-    """
-    logging.info(f"🖼️ [ЗАГЛУШКА] Начата генерация изображения для промпта: {text_prompt[:50]}...")
-    # Здесь должен быть код для вызова API генерации изображений.
-    # В данный момент функция возвращает None, чтобы показать, что картинка не была создана.
-    image_path = None
-    if image_path:
-        logging.info(f"✅ Изображение успешно сгенерировано и сохранено: {image_path}")
-    else:
-        logging.warning("⚠️ Генерация изображения пропущена (функция-заглушка).")
-    return image_path
-
-def post_to_linkedin(text):
-    # Сначала получаем ваш ID пользователя (URN)
-    user_info = requests.get(
-        "https://api.linkedin.com/v2/userinfo",
-        headers={"Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}"},
-    ).json()
-
-    author_id = user_info.get("sub")  # Это ваш уникальный идентификатор
-
-    # Формируем структуру поста
-    post_data = {
-        "author": f"urn:li:person:{author_id}",
-        "lifecycleState": "PUBLISHED",
-        "specificContent": {
-            "com.linkedin.ugc.ShareContent": {
-                "shareCommentary": {"text": text},
-                "shareMediaCategory": "NONE",
-            }
-        },
-        "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"},
-    }
-
-    # Отправляем пост
-    response = requests.post(
-        "https://api.linkedin.com/v2/ugcPosts",
-        headers={
-            "Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}",
-            "X-Restli-Protocol-Version": "2.0.0",
-        },
-        json=post_data,
-    )
-    logging.info(f"Ответ LinkedIn: {response.status_code}, {response.text}")
-    return response.status_code == 201
-
-
 def is_relevant(text):
     text_lower = text.lower()
-    if any(word.lower() in text_lower for word in KEYWORDS_EXCLUDE):
-        return False
-    if any(word.lower() in text_lower for word in KEYWORDS_INCLUDE):
-        return True
-    return False
+    if any(word.lower() in text_lower for word in KEYWORDS_EXCLUDE if word):
+        return None
+    for word in KEYWORDS_INCLUDE:
+        if word and word.lower() in text_lower:
+            return word  # Возвращаем найденное ключевое слово
+    return None
 
 
-# 1. Единый Промпт для всех нейросетей
-def create_prompt(title, summary, link):
-    return f"""
-    ROLE:
-    You are Roman, a passionate Junior SOC Analyst from the Heilbronn region (Germany). You are a Master's student, a cybersecurity geek, and you constantly monitor news.
+# 1. Единый Промпт для всех нейросетей (ИНТЕГРИРОВАН НОВЫЙ ЖИВОЙ ВАРИАНТ)
+def create_prompt(title, summary, link, lang="DE"):
+    full_content = f"{title} {summary}".lower()
 
-    TASK:
-    Retell the provided technical news for LinkedIn as if you are sitting in a pub with IT friends in the evening, telling them this story with burning eyes.
+    # Проверяем, относится ли новость к карьере, обучению или акциям
+    is_career_or_promo = any(word in full_content for word in [
+        "cert", "education", "job", "career", "scholarship", "voucher", "free exam", "mentorship", "training"
+    ])
 
-    🚫 NEGATIVE CONSTRAINTS (STRICTLY FORBIDDEN):
-    1. NO SLANG: Do NOT use words like "krass", "krank", "Wahnsinn", "Leute".
-    2. NO CHILDISH LANGUAGE: Do NOT use "schlechte Projekte" or "böse Hacker".
-       -> INSTEAD USE: "manipulierte Projekte", "schadcode-infizierte Add-ons", "kriminelle Akteure".
-    3. NO TAUTOLOGIES: Do NOT write "kostenlose oder kostenlose". Check for repetitive logic within a sentence.
-    4. NO "SALES" TONE: Do not sound like you are selling the news. Analyze it.
-    5. NO GENERIC PHRASES: Do NOT use phrases like "In der heutigen digitalen Welt", "Mit der zunehmenden Digitalisierung".
-       -> INSTEAD: Be specific to the news item.
-    6. NO APOLOGIES: Do NOT say "As a SOC analyst I see this in my logs" for non-technical news.
-       -> INSTEAD: Discuss from a Risk Management (GRC) perspective: Mention "Availability Risks", "Supply Chain", or "Business Continuity".    
+    # Уникальные жесткие инструкции и ИТ-сленг для каждого языка отдельно, включая критические приветствия
+    lang_map = {
+        "DE": """
+        Write 100% in Business German. 
+        Tone: Professional, expert, but casual ("Coffee break with colleagues").
+        CRITICAL GREETING: Start strictly with "Hallo Community!" or "Hallo Kollegen!". Do NOT use "Hallo ihr".
+        CRITICAL: Use ONLY informal "du", "ihr", "euch", "eure". Formal "Sie/Ihre" is STRICTLY FORBIDDEN.
+        Do NOT hardcode specific infrastructure terms unless they are explicitly mentioned in the input news. Use flexible German IT terminology tailored strictly to the actual threat vector (e.g., Access Management, Datenvertraulichkeit, Richtlinien).
+        """,
+        
+        "EN": """
+        Write 100% in English (US). 
+        Tone: High-energy, professional, tech-savvy. 
+        Style: Modern LinkedIn tech-influencer/engineer.
+        CRITICAL GREETING: Start strictly with "Hi Community," or "Hello colleagues,". Do NOT use "Hey folks" or "Hi guys".
+        Use words like: "compromised", "blast radius", "identity security", "least privilege".
+        Address the community naturally: "What's your take on this?".
+        """,
+        
+        "UA": """
+        Write 100% in Ukrainian. 
+        Tone: Professional, modern, peer-to-peer (як інженер для інженерів).
+        CRITICAL GREETING: Start strictly with "Вітаю, колеги!" or "Привіт, ком'юніті!". 
+        DO NOT copy raw prompt text like "ви/ваша думка".
+        Address the audience using respectful "ви / ваш / як ви вважаєте".
+        Use natural Ukrainian IT slang combined with English terms: інсайдерські загрози, Privilege Escalation, логування, компрометація облікових записів, мінімальні привілеї (Least Privilege).
+        """,
+        
+        "RU": """
+        Write 100% in Russian. 
+        Tone: Professional, experts-only, direct.
+        Style: Живой блог практикующего инженера. Без канцеляризмов и без панибратства.
+        CRITICAL GREETING: Start strictly with "Приветствую, коллеги!" or "Привет, комьюнити!". 
+        STRICTLY FORBIDDEN to use words like "ребята", "парни", "мальчики". This is for senior IT professionals.
+        Address the audience using professional "вы", "коллеги". 
+        Use standard, active SOC-analyst slang: инсайдерские угрозы, эскалация привилегий, Privilege Escalation, собирать логи, SIEM/Splunk, модель нулевого доверия (Zero Trust), учетки.
+        """
+    }
     
+    target_lang_instruction = lang_map.get(lang, lang_map["DE"])
 
+    if is_career_or_promo:
+        # ==========================================
+        # СТИЛЬ Б: КАРЬЕРА, СЕРТИФИКАЦИИ, ОБУЧЕНИЕ
+        # ==========================================
+        return f"""
+        ROLE:
+        You are an experienced SOC Analyst sharing useful career opportunities, initiatives, materials, and free certifications for students and juniors on LinkedIn. 
+        Your tone must be empowering, motivating, and supportive.
 
-    CRITICAL INSTRUCTION (THE "HUMAN" RULE):
-    - **DO NOT** structure the text with headers like "### Hook" or "### Story". 
-    - **DO NOT** use labels like "Analysis:" or "The Good:".
-    - **WRITE A FLUID STORY.** One paragraph must flow into the next naturally using transition phrases (e.g., "Das Kranke daran ist...", "Für mich heißt das...").
+        CORE REASONING RULE:
+        If the input 'Summary' or 'Title' is too short or abstract, use your deep cyber security knowledge base to reconstruct the technical context. Do NOT write tautologies.
 
-    CRITICAL VISUAL RULE (CONTEXTUAL EMOJIS):
-    - **Analyze the content first.**
-    - **Do NOT use headers** (like "### Analysis").
-    - **IF the news is about Politics, Physical Hardware (e.g., Starlink seizures), Laws, or Geopolitics:**
-       -> Do NOT say "As a SOC analyst I see this in my logs". That makes no sense.
-       -> Instead, discuss it from a **Risk Management (GRC)** perspective: Mention "Availability Risks", "Supply Chain", or "Business Continuity".
-    - **Instead, start EVERY paragraph with ONE emoji that matches the topic:**
-      - If talking about the **Shock/News** -> use 🚨, 🤯, or ⚠️
-      - If talking about the **Technical Hack** -> use 💻, ⚙️, or 🔓
-      - If talking about **Bad Consequences** -> use 🛑, ❌, or 📉
-      - If talking about **Good News/Patch** -> use ✅, 👍, or 🛠️
-      - If talking about **SOC/Defense/Splunk** -> use 🛡️, 🔍, or 👁️
-      - If asking a **Question** -> use ❓, 🧐, or 💭
+        TASK:
+        Write a LinkedIn post about a great career opportunity or community initiative based on the input text.
 
+        🚫 NEGATIVE CONSTRAINTS:
+        1. DO NOT mention "Business Continuity Risks", "Availability Risks", or "CISOs" for career posts.
+        2. DO NOT say you "discovered" or "analyzed" this yourself. You just found this great news/resource.
+        3. NO Markdown headers (###), NO Bold text (**text**), NO Bullet points (*).
+        4. OUTPUT LANGUAGE: {target_lang_instruction}
 
+        STRUCTURE & VISUAL RULES (STRICTLY FOLLOW):
+        1. 👋 **Intro:** Greet the IT community warmly. Mention you found a great resource for career development or certification prep.
+        2. 📰 **Original Title:** On a new line, output the original English title with a 📰 emoji.
+        3. 🚀 **The Opportunity:** Briefly explain what this resource/initiative is about (2-3 sentences). Start with 🚀.
+        4. 💡 **Your Advice / Value:** Provide concrete examples of practical value a junior can get there (e.g., cert names like CompTIA Security+, Cisco CyberOps, or how to pass a CV filter). Start with 💡.
+        5. 🎯 **Call to Action:** Encourage the community to use this opportunity ("Nutzt diese Chance" / "Используйте этот шанс" etc.). Start with 🎯.
+        6. ❓ **Discussion:** Start a new paragraph strictly with the ❓ emoji followed immediately by the question text on the same line (e.g., "❓ Wie seht ihr..."). DO NOT leave the emoji alone on a line.
+        7. 🔗 **Link:** Start a new paragraph. Write exactly: "🔗 Quelle: {link}"
+        8. #️⃣ **Hashtags:** Force a new line. Add 4-5 relevant hashtags.
 
-    TONE (VIBE):
-    - **Lively & Energetic:** Use phrases like "Stellt euch vor", "Leute, das ist krass", "Endlich!".
-    - **Simple Language:** Remove complex bureaucracy. Use professional slang (SOC, SIEM, Ransomware).
-    - **Local Context:** Highlight Germany/Europe relevance.
-    - **Output Language:** GERMAN.
-    - **Avoid Repetition:** Do not use the word "Angriff" or "Attacke" more than 3 times. Use synonyms like "Vorfall", "Bedrohung", "Kampagne", "Infiltration".
-    - **Vocabulary:** Use precise IT terms (Backdoor, Supply Chain Attack, Repository, Payload).
-    
-    CRITICAL LANGUAGE RULE:
-    - Language: **100% GERMAN** (Business German). No mixed English grammar.
-    - Vibe: "Coffee break with colleagues". Professional but human.
-    - Not too surprised ("Krass!"). Be analytical ("Bedenklich", "Spannend").
-    - DO NOT mix English words like "already", "however", "but" into German sentences.
-    - Technical terms (Exploit, Backdoor, SIEM, VS Code) MUST remain in English.
+        INPUT NEWS:
+        Title: "{title}"
+        Summary: "{summary}"
+        Link: {link}
+        """
+    else:
+        # ==========================================
+        # STYLE A: CYBERATTACKS & VULNERABILITIES
+        # ==========================================
+        return f"""
+        ROLE:
+        You are a practicing SOC Analyst running a professional technical blog on LinkedIn for fellow IT professionals, SOC analysts, and system administrators. 
+        Your tone is professional, expert, analytical, and CONCISE.
 
-    STRUCTURE (STRICTLY FOLLOW):
-    1. Hook: Start with emotion/question.
-    2. The Story: Briefly, in 2-3 sentences, what happened.
-    3. Transition to analysis (Pros/Cons).
-    4. Impact (GRC & SOC): Why is this important? (Risk, Splunk, Logs).
-    5. Engagement: **FORCE A NEW PARAGRAPH HERE.** Start this paragraph strictly with ❓. Ask friends' opinions ("Wie seht ihr das?", "Eure Meinung?").
-    6. Link: **FORCE A NEW PARAGRAPH HERE.** Write ONLY: "🔗 Quelle: {link}"
-    7. Hashtags: **FORCE A NEW PARAGRAPH HERE.** Add 4-5 relevant hashtags on a new line (e.g. #CyberSecurity #SOC).
+        TASK:
+        Analyze the provided cyber security news and write a LinkedIn post. 
 
-    VISUAL STRUCTURE (EMOJIS):
-    Start paragraphs with these emojis ONLY:
-    - 🚨 (News/Alert)
-    - ⚙️ (Technical Details/Hack)
-    - 🛡️ (Defense/SOC/GRC Perspective)
-    - ❓ (Discussion Question)
+        🚫 NEGATIVE CONSTRAINTS:
+        1. DO NOT say you "discovered" or "detected" this vulnerability yourself.
+        2. DO NOT address only CISOs. Focus on the practicing IT community.
+        3. NO TAUTOLOGIES & EMPTY PHRASES: Do not write sentences like "Die Angreifer nutzen Exploits, um Lücken auszunutzen".
+        4. NO Markdown headers (###), NO Bold text (**text**), NO Bullet points (*).
+        5. OUTPUT LANGUAGE: {target_lang_instruction}
 
-    FORMATTING RESTRICTIONS (STRICT):
-    - NO Markdown headers (###).
-    - NO Bold text (**text**). Use "quotation marks".
-    - NO Bullet points (*). Use emojis (🛡️, 🚨, 📉, 💻).
-    - NO Beer emojis (🍺).
+        STRUCTURE & VISUAL RULES (STRICTLY FOLLOW):
+        1. 👋 **Intro:** Greet the community and mention a critical alert you just read about.
+        2. 📰 **Original Title:** The original English title with a 📰 emoji.
+        3. ⚙️ **Technical Details:** Explain exactly WHAT happened based on the source. Mention specific vectors if applicable (e.g., credential leaking, configuration flaws, or access abuse). Max 2-3 packed, high-value sentences. Start strictly with a ⚙️ emoji.
+        4. ⚠️ **The Core Threat:** Highlight the exact technical or architectural reason why this is critical (e.g., threat to data confidentiality, system integrity, or stealthy persistence in the network). Be precise and avoid generic noise. Start strictly with a ⚠️ emoji.
+        5. 🛡️ **Community Verdict (SOC/GRC):** Provide professional analytical insight instead of generic advice. Mention concrete defense steps relevant to the specific threat type: what should an engineer check tomorrow morning? (e.g., tailored architectural hardening, specific monitoring focus, access control updates, or technical verification metrics). Start strictly with a 🛡️ emoji.
+        6. ❓ **Discussion:** Start a new paragraph strictly with the ❓ emoji followed immediately by the question text on the same line (e.g., "❓ Wie seht ihr..."). DO NOT leave the emoji alone on a line.
+        7. 🔗 **Link:** Start a new paragraph. Write exactly: "🔗 Quelle: {link}"
+        8. #️⃣ **Hashtags:** Force a new line. Add hashtags.
 
-    
-    INPUT NEWS:
-    Title: "{title}"
-    Summary: "{summary}"
-    Link: {link}
-    """
-
+        INPUT NEWS:
+        Title: "{title}"
+        Summary: "{summary}"
+        Link: {link}
+        """
 
 # 2. Функция очистки текста
 def clean_response_text(text):
-    text = text.replace("—", "-")
-    text = text.replace("`", '"')
-    text = text.replace("*", '"')
-    text = text.replace('""', '"')
-    text = text.replace("###", "")
+    text = text.replace("—", "-").replace("`", '"').replace("*", '"').replace('""', '"').replace("###", "")
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     return text
@@ -281,168 +255,175 @@ def clean_response_text(text):
 # ==========================================
 # ГЕНЕРАТОР ПОСТОВ
 # ==========================================
-def generate_linkedin_post(title, summary, link):
-    logging.info(f"🧠 Генерирую пост: {title[:30]}...")
-    prompt_text = create_prompt(title, summary, link)
+def generate_linkedin_post(title, summary, link, lang="DE"):
+    # --- Используем только GROQ (Llama 3.3) ---
+    if not client_groq:
+        logging.error("❌ Клиент Groq не инициализирован.")
+        return None
 
-    # --- ПОПЫТКА 1: GEMINI (Google) ---
+    logging.info(f"🧠 Генерирую пост ({lang}): {title[:30]}...")
+    prompt_text = create_prompt(title, summary, link, lang)
+
     try:
-        logging.info(f"🔹 Пробую Gemini ({GEMINI_MODEL})...")
-        response = client_gemini.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt_text,
-            config={"temperature": 0.3},
+        chat_completion = client_groq.chat.completions.create(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a professional LinkedIn ghostwriter who follows instructions precisely.",
+                },
+                {"role": "user", "content": prompt_text},
+            ],
+            model=GROQ_MODEL,
+            temperature=0.4,
         )
-        logging.info("✅ Gemini успешно сгенерировал.")
-        return clean_response_text(response.text)
+        post_text = chat_completion.choices[0].message.content
+        return clean_response_text(post_text)
+    except Exception as e_groq:
+        error_message = str(e_groq)
+        logging.error(f"❌ Ошибка Groq: {error_message}")
+        if "rate_limit_exceeded" in error_message or "429" in error_message:
+            return "RATE_LIMIT_EXCEEDED"
+        return None
 
-    except Exception as e_gemini:
-        logging.warning(f"⚠️ Ошибка Gemini: {e_gemini}")
 
-        # --- ПОПЫТКА 2: GROQ (Llama 3 - Бесплатно) ---
-        if client_groq:
-            logging.info(f"🔄 Переключаюсь на Groq ({GROQ_MODEL})...")
-            try:
-                chat_completion = client_groq.chat.completions.create(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are a professional LinkedIn ghostwriter.",
-                        },
-                        {"role": "user", "content": prompt_text},
-                    ],
-                    model=GROQ_MODEL,
-                    temperature=0.3,  # <--- Добавь это. 0.3 делает его строже.
-                )
-                logging.info("✅ Groq успешно сгенерировал.")
-                return clean_response_text(chat_completion.choices[0].message.content)
-            except Exception as e_groq:
-                return f"❌ Ошибка обоих нейросетей. Groq Error: {e_groq}"
-        else:
-            return f"❌ Gemini упал, а ключ Groq не задан. Ошибка Gemini: {e_gemini}"
-
+# ==========================================
+# СБОРЩИК КЛАВИАТУРЫ
+# ==========================================
+def build_keyboard(draft_text, link, current_lang="DE"):
+    encoded_text = urllib.parse.quote(draft_text)
+    encoded_link = urllib.parse.quote(link)
+    linkedin_web_url = f"https://www.linkedin.com/sharing/share-offsite/?url={encoded_link}&text={encoded_text}"
+    
+    markup = InlineKeyboardMarkup(row_width=4)
+    
+    # Кнопки выбора языков. Активный язык помечаем галочкой ✅
+    btn_de = InlineKeyboardButton(f"{'✅ ' if current_lang=='DE' else ''}DE", callback_data="lang_de")
+    btn_en = InlineKeyboardButton(f"{'✅ ' if current_lang=='EN' else ''}EN", callback_data="lang_en")
+    btn_ua = InlineKeyboardButton(f"{'✅ ' if current_lang=='UA' else ''}UA", callback_data="lang_ua")
+    btn_ru = InlineKeyboardButton(f"{'✅ ' if current_lang=='RU' else ''}RU", callback_data="lang_ru")
+    
+    markup.add(btn_de, btn_en, btn_ua, btn_ru)
+    # Главная кнопка публикации всегда ведет на актуальный текст
+    markup.add(InlineKeyboardButton("🚀 Открыть в LinkedIn", url=linkedin_web_url))
+    return markup
 
 # ==========================================
 # ЛОГИКА СКАНЕРА
 # ==========================================
 def check_news():
-    global processed_links
-
-    logging.info("🔎 Сканирую новости...")
-    new_post_found = False
-
+    global processed_links, news_storage
+    
+    logging.info("🔎 Запуск сквозного сканирования ВСЕХ ресурсов...")
+    
+    # Проходим абсолютно по каждому URL из списка источников
     for url in RSS_URLS:
-        if new_post_found:
-            break
-
         try:
-            feed = feedparser.parse(url)
-            if not feed.entries:
-                continue
+            logging.info(f"Паршу источник: {url}")
+            
+            # Прикидываемся браузером, чтобы сервера отдавали XML без лишних проверок
+            feed = feedparser.parse(url, agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
+            if not feed.entries:
+                logging.info(f"Источник пуст или недоступен (нет записей): {url}")
+                continue
+    
+            # Берем топ-3 свежих записей из текущего источника
             for entry in feed.entries[:3]:
-                # 1. Проверка в памяти
+                # Если ссылку уже обрабатывали ранее — строго пропускаем
                 if entry.link in processed_links:
                     continue
-
-                # 2. Проверка релевантности
+    
                 full_text = f"{entry.title} {entry.description}"
-                if is_relevant(full_text):
-                    logging.info(f"🔥 Нашел релевантную новость: {entry.title}")
-
-                    # 3. Генерация
-                    draft = generate_linkedin_post(
-                        entry.title, entry.description, entry.link
-                    )
-
-                    # 4. Сохранение
-                    save_to_history(str(entry.link))
-                    processed_links.add(str(entry.link))
-
-                    # 5. ВЫЗЫВАЕМ ГЕНЕРАЦИЮ КАРТИНКИ
-                    image_path = generate_image_smart(draft)
-
-                    # 6. ОТПРАВЛЯЕМ В TELEGRAM
-                    markup = InlineKeyboardMarkup()
-                    markup.add(
-                        InlineKeyboardButton( # type: ignore
-                            "🚀 Posten", callback_data="post_to_linkedin"
-                        )
-                    )
+                relevance_keyword = is_relevant(full_text)
+                if relevance_keyword:
+                    logging.info(f"🔥 Нашел релевантную новость: {entry.title} ({url})")
+    
+                    # Изначально генерируем на немецком (DE)
+                    draft = generate_linkedin_post(entry.title, entry.description, entry.link, lang="DE")
+                    if not draft:
+                        continue
+    
+                    markup = build_keyboard(draft, entry.link, current_lang="DE")
+    
                     try:
-                        # Если картинка успешно создалась, отправляем сначала её
-                        if image_path:
-                            with open(image_path, 'rb') as photo:
-                                bot.send_photo(chat_id=CHAT_ID, photo=photo)
-                            logging.info("✅ Картинка отправлена в Telegram.")
-
-                        # Затем отправляем сам текст поста с кнопкой
-                        sent_message = bot.send_message(
-                            CHAT_ID,
-                            f"📰 {entry.title}\n\n📝 {draft}",
-                            reply_markup=markup,
-                        )
-                        logging.info(f"✅ Черновик отправлен в Telegram. ID: {sent_message.message_id}")
-
-                        # Сохраняем черновик в память, привязав к ID сообщения
-                        drafts_in_memory[sent_message.message_id] = draft
-                        new_post_found = True
-                        break
+                        sent_message = bot.send_message(CHAT_ID, draft, reply_markup=markup)
+                        logging.info(f"✅ Черновик отправлен. ID: {sent_message.message_id}")
+    
+                        # Сохраняем метаданные и первый черновик, привязывая к ID сообщения в TG
+                        news_storage[sent_message.message_id] = {
+                            "title": entry.title,
+                            "description": entry.description,
+                            "link": entry.link,
+                            "drafts": {"DE": draft} # Сохраняем первый сгенерированный черновик
+                        }
+                        
+                        save_to_history(str(entry.link))
+                        processed_links.add(str(entry.link))
                     except Exception as e_tg:
                         logging.error(f"❌ Ошибка отправки в Telegram: {e_tg}")
                 else:
-                    # Если не релевантно - запоминаем, чтобы не проверять снова
                     processed_links.add(str(entry.link))
 
         except Exception as e:
             logging.error(f"❌ Ошибка при парсинге RSS ({url}): {e}")
-            
-    if not new_post_found:
-        logging.info("✅ Сканирование завершено. Новых релевантных новостей нет.")
 
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-    if call.data == "post_to_linkedin":
-        # Извлекаем правильный текст из словаря по ID сообщения
-        text_to_post = drafts_in_memory.get(call.message.message_id)
-        if not text_to_post:
-            bot.answer_callback_query(
-                call.id,
-                "❌ Ошибка: черновик не найден. Возможно, бот был перезапущен.",
-            )
-            return
-        success = post_to_linkedin(text_to_post)
+# ==========================================
+# ОБРАБОТЧИК ИНТЕРАКТИВНЫХ КНОПОК ЯЗЫКА
+# ==========================================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("lang_"))
+def handle_language_switch(call):
+    message_id = call.message.message_id
+    target_lang = call.data.split("_")[1].upper() # Получаем DE, EN, UA или RU
+    
+    # Достаем сохраненный оригинал новости
+    news_data = news_storage.get(message_id)
+    if not news_data:
+        bot.answer_callback_query(call.id, "❌ Ошибка: Исходные данные новости не найдены в памяти.")
+        return
 
-        if success:
-            bot.answer_callback_query(call.id, "✅ Опубликовано в LinkedIn!")
-        else:
-            bot.answer_callback_query(call.id, "❌ Ошибка при публикации.")
+    # 1. Проверяем, есть ли уже готовый черновик в кэше
+    if target_lang in news_data.get("drafts", {}):
+        new_draft = news_data["drafts"][target_lang]
+        bot.answer_callback_query(call.id, f"✅ Загружено из кэша: {target_lang}")
+    else:
+        # 2. Если в кэше нет, генерируем и сохраняем
+        bot.answer_callback_query(call.id, f"🔄 Генерирую пост на языке: {target_lang}...")
+        new_draft = generate_linkedin_post(news_data["title"], news_data["description"], news_data["link"], lang=target_lang)
+        if new_draft and new_draft != "RATE_LIMIT_EXCEEDED":
+            news_storage[message_id]["drafts"][target_lang] = new_draft
+    
+    if new_draft:
+        # Пересобираем клавиатуру с новым текстом внутри ссылки LinkedIn и ставим галочку на нужный язык
+        new_markup = build_keyboard(new_draft, news_data["link"], current_lang=target_lang)
+        
+        # Обновляем сообщение в Telegram на лету!
+        bot.edit_message_text(chat_id=CHAT_ID, message_id=message_id, text=new_draft, reply_markup=new_markup)
+    else:
+        error_text = "❌ Ошибка генерации текста."
+        if new_draft == "RATE_LIMIT_EXCEEDED":
+            error_text = "🚫 API-лимит исчерпан. Попробуйте позже."
+        bot.answer_callback_query(call.id, error_text)
 
 
 if __name__ == "__main__":
     logging.info(f"📂 Загружено {len(processed_links)} ссылок из history.txt")
 
-    # 1. Сразу при запуске проверяем новости один раз
     check_news()
 
-    # 2. Настраиваем планировщик в отдельном потоке
     def run_scheduler():
-        # Рекомендую поставить 60 минут или 2 часа (120)
         schedule.every(120).minutes.do(check_news)
         while True:
             schedule.run_pending()
             time.sleep(1)
 
-    # Запускаем поток с расписанием
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
 
     logging.info("🤖 Бот запущен и готов к работе...")
 
-    # 3. Запускаем бесконечный опрос Telegram
     try:
         bot.polling(none_stop=True)
     except Exception as e:
-        logging.critical(f"💥 Критическая ошибка в главном цикле polling: {e}")
-        time.sleep(15)  # Пауза перед перезапуском при сбое сети
+        logging.critical(f"💥 Критическая ошибка в polling: {e}")
+        time.sleep(15)
