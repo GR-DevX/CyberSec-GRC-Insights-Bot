@@ -13,9 +13,6 @@ from dotenv import load_dotenv
 from groq import Groq  # pip install groq
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# Загрузка переменных окружения
-load_dotenv(".env")
-
 # ==========================================
 # 🔴 НАСТРОЙКИ (КЛЮЧИ ИЗ .ENV)
 # ==========================================
@@ -25,6 +22,10 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     stream=sys.stdout,
 )
+
+# Загрузка переменных окружения только для локального запуска (когда нет Docker)
+# В Docker-контейнере переменные передаются через docker-compose.yml
+load_dotenv(".env")
 
 # --- Telegram ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -55,11 +56,18 @@ def validate_env_vars():
         "RSS_URLS": RSS_URLS and RSS_URLS[0],  # Проверяем, что список не пустой
         "KEYWORDS_INCLUDE": KEYWORDS_INCLUDE and KEYWORDS_INCLUDE[0],  # И здесь тоже
     }
+    
+    # Логируем статус каждой переменной для отладки
+    for key, value in required_vars.items():
+        status = "✅" if value else "❌"
+        logging.info(f"Проверка переменной: {key} ... {status}")
+
     missing_vars = [key for key, value in required_vars.items() if not value]
     if missing_vars:
         logging.error(
             f"❌ Критическая ошибка: Отсутствуют переменные в .env: {', '.join(missing_vars)}"
         )
+        logging.error("💡 Убедитесь, что в файле .env заданы значения для всех этих ключей и перезапустите контейнер.")
         sys.exit(1)
 
 
