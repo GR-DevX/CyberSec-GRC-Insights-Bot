@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 import threading
+import json
 import time
 import urllib.parse
 
@@ -41,7 +42,10 @@ KEYWORDS_EXCLUDE = os.getenv("KEYWORDS_EXCLUDE", "").split(",")
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # --- Файл истории ---
-HISTORY_FILE = "history.txt"
+DATA_DIR = "/app/data" # Папка для хранения данных в Docker-томе
+HISTORY_FILE = os.path.join(DATA_DIR, "history.txt")
+CACHE_FILE = os.path.join(DATA_DIR, "news_cache.json")
+os.makedirs(DATA_DIR, exist_ok=True) # Создаем папку, если ее нет
 
 
 # ==========================================
@@ -85,11 +89,47 @@ if GROQ_API_KEY and GROQ_API_KEY.startswith("gsk_"):
 
 # Глобальные переменные для хранения состояния
 processed_links = set()
-# Храним исходные данные новостей для перегенерации на других языках
-# Структура: {message_id: {"title": title, "summary": summary, "link": link}}
-news_storage = {}
+
 
 # ==========================================
+# ЛОГИКА КЭША НОВОСТЕЙ (NEWS_CACHE.JSON)
+# ==========================================
+def load_news_cache():
+    """Загружает кэш новостей из JSON-файла при старте"""
+    if os.path.isdir(CACHE_FILE):
+        logging.error(
+            f"❌ ОШИБКА: '{CACHE_FILE}' является директорией. Удалите ее и перезапустите бота."
+        )
+        sys.exit(1)
+
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                # В JSON ключи всегда строки, превращаем ID сообщений обратно в int
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except (json.JSONDecodeError, ValueError) as e:
+            logging.error(f"⚠️ Ошибка загрузки или парсинга кэша новостей: {e}. Создается новый кэш.")
+            return {}
+    else:
+        # Если файла нет, создаем его, чтобы избежать создания директории Docker'ом
+        open(CACHE_FILE, "a").close()
+        logging.info(f"Файл кэша '{CACHE_FILE}' не найден, создан новый пустой файл.")
+    return {}
+
+
+def save_news_cache():
+    """Сохраняет текущий кэш новостей в JSON-файл"""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(news_storage, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logging.error(f"❌ Ошибка сохранения кэша новостей на диск: {e}")
+
+
+# Загружаем кэш из файла при старте скрипта
+news_storage = load_news_cache()
+
 # ЛОГИКА ПАМЯТИ (HISTORY.TXT)
 # ==========================================
 
@@ -362,11 +402,14 @@ def check_news():
                             "title": entry.title,
                             "description": entry.description,
                             "link": entry.link,
-                            "drafts": {"DE": draft} # Сохраняем первый сгенерированный черновик
+                            "drafts": {"DE": draft},  # Сохраняем первый сгенерированный черновик
                         }
+                        # Сразу фиксируем изменения на диске
+                        save_news_cache()
                         
                         save_to_history(str(entry.link))
                         processed_links.add(str(entry.link))
+
                     except Exception as e_tg:
                         logging.error(f"❌ Ошибка отправки в Telegram: {e_tg}")
                 else:
@@ -400,6 +443,8 @@ def handle_language_switch(call):
         new_draft = generate_linkedin_post(news_data["title"], news_data["description"], news_data["link"], lang=target_lang)
         if new_draft and new_draft != "RATE_LIMIT_EXCEEDED":
             news_storage[message_id]["drafts"][target_lang] = new_draft
+            # Сохраняем обновленный кэш с новым переводом
+            save_news_cache()
     
     if new_draft:
         # Пересобираем клавиатуру с новым текстом внутри ссылки LinkedIn и ставим галочку на нужный язык

@@ -7,6 +7,10 @@ services:
     env_file:
       - .env  # Docker-compose сам подтянет ключи из локального .env
     volumes:
-      - type: bind
-        source: ./history.txt
-        target: /app/history.txt
+      # Монтируем именованный том в папку /app/data внутри контейнера.
+      # Все данные, записанные в /app/data, теперь будут храниться в томе CyberSec_Vol.
+      - CyberSec_Vol:/app/data
+
+volumes:
+  CyberSec_Vol:
+    external: true # Указываем, что том создан вручную (docker volume create CyberSec_Vol)
